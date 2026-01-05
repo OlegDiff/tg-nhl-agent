@@ -1,0 +1,5 @@
+﻿openai
+python-dotenv
+pydantic
+httpx
+rich

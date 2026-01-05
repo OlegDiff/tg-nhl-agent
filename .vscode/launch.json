@@ -1,0 +1,13 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Run tg_nhl_agent.main (uv)",
+            "type": "python",
+            "request": "launch",
+            "module": "tg_nhl_agent.main",
+            "console": "integratedTerminal",
+            "justMyCode": true
+        }
+    ]
+}

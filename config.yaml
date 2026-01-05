@@ -1,0 +1,20 @@
+app:
+  timezone: "Europe/Moscow"
+
+schedule:
+  morning_1: "07:30"
+  morning_2: "11:00"
+
+sources:
+  nhl_api: true
+  vk_video: true
+
+preferences:
+  # первая версия — вручную
+  favorite_teams: []
+  favorite_players: []
+
+output:
+  mode: "telegram_channel"  # or "telegram_chat"
+  max_recommendations: 5
+  spoiler_free: true
