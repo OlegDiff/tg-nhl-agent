@@ -26,6 +26,9 @@ jobs:
       - name: Sync dependencies (locked)
         run: uv sync --locked --dev
 
+      - name: Install project (editable)
+        run: uv pip install -e .
+
       - name: Ruff (lint)
         run: uv run ruff check .
 
