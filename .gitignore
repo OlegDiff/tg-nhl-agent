@@ -9,3 +9,7 @@ wheels/
 # Virtual environments
 .venv/
 logs/
+
+# Local run output
+output/
+*_backup.py

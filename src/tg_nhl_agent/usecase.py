@@ -1,16 +1,22 @@
-# usecase.py
+# src/tg_nhl_agent/usecase.py
 """
-Walking skeleton use-case for the NHL rewatch recommender.
+MVP v1: NHL rewatch recommender WITHOUT VK links.
 
 Содержит:
-- Порты (Protocol) для адаптеров
-- Оркестрацию пайплайна: load -> score -> rank -> video -> post -> publish
-- Минимальный рендер в текст (без спойлеров)
-- Мок-адаптеры (чтобы можно было сразу запустить и увидеть результат)
+- Порты (Protocol) для адаптеров:
+  - results_loader (матчи + статы игроков)
+  - rules_loader (таблица весов/интереса)
+  - publisher (публикация текста)
+  - registry (идемпотентность, но отключается в DRY_RUN)
+- Оркестрацию пайплайна: load -> score -> rank -> post -> publish
+- Рендер в текст (без спойлеров, без ссылок на видео)
+- Мок-адаптеры (smoke test)
 
-Важно:
-- usecase НЕ тянет сеть/БД сам. Всё внешнее — через порты.
-- Данные для расчета могут содержать счет/статы, но публичный пост их не содержит.
+DRY_RUN:
+- если cfg.dry_run = True, то:
+  - НЕ выполняем идемпотентность (не блокируем повторные запуски)
+  - НЕ записываем state (registry.set_published не вызывается)
+  - publish всё равно вызывается (в dev это StdoutPublisher)
 """
 
 from __future__ import annotations
@@ -21,7 +27,6 @@ from typing import Dict, List, Optional, Protocol, Tuple
 from zoneinfo import ZoneInfo
 
 from .contracts import (
-    # data
     AppError,
     MatchForScoring,
     MatchScore,
@@ -32,13 +37,9 @@ from .contracts import (
     RankedMatch,
     ScoreContribution,
     ScoringRule,
-    # enums
     Severity,
     SourceSystem,
     Team,
-    VideoKind,
-    VideoLinkResult,
-    VideoStatus,
 )
 
 # -----------------------------
@@ -50,12 +51,11 @@ from .contracts import (
 class UsecaseConfig:
     tz_msk: str = "Europe/Moscow"
     publish_hour_msk: int = 8
-
-    # window = последние 48 часов от 08:00 MSK текущего дня
     lookback_hours: int = 48
-
-    # фильтр по интересности (можно настроить позже)
     min_interest_score: float = 0.0
+
+    # DEV режим: не блокируем повторные запуски, не пишем state
+    dry_run: bool = False
 
 
 # -----------------------------
@@ -68,50 +68,21 @@ class ResultsLoader(Protocol):
         self,
         window_start_utc: datetime,
         window_end_utc: datetime,
-    ) -> Tuple[List[MatchForScoring], List[PlayerGameStats], List[AppError]]:
-        """
-        Должен вернуть завершенные матчи за окно времени + агрегированные статы игроков.
-        Ошибки кладем в errors (не исключениями), если это не фатально.
-        """
-        ...
+    ) -> Tuple[List[MatchForScoring], List[PlayerGameStats], List[AppError]]: ...
 
 
 class ScoringRulesLoader(Protocol):
-    def load(self) -> Tuple[List[ScoringRule], List[AppError]]:
-        """Возвращает таблицу 'повышающих очков'."""
-        ...
-
-
-class VideoLoader(Protocol):
-    def load_for_matches(
-        self,
-        match_ids: List[str],
-    ) -> Tuple[List[VideoLinkResult], List[AppError]]:
-        """
-        Возвращает результаты поиска видео по всем матчам и видам роликов.
-        Рекомендуется возвращать ровно 2 результата на матч (highlights + full),
-        со статусами FOUND/NOT_FOUND/ERROR.
-        """
-        ...
+    def load(self) -> Tuple[List[ScoringRule], List[AppError]]: ...
 
 
 class Publisher(Protocol):
-    def publish(self, text: str) -> Tuple[Optional[str], List[AppError]]:
-        """
-        Публикует текст в Telegram (или куда угодно).
-        Возвращает message_id (если применимо) и errors.
-        """
-        ...
+    def publish(self, text: str) -> Tuple[Optional[str], List[AppError]]: ...
 
 
 class PublicationRegistry(Protocol):
-    def get(self, run_date_msk: date) -> Tuple[Optional[PublicationRecord], List[AppError]]:
-        """Читает запись об уже выполненной публикации (идемпотентность)."""
-        ...
+    def get(self, run_date_msk: date) -> Tuple[Optional[PublicationRecord], List[AppError]]: ...
 
-    def set_published(self, record: PublicationRecord) -> List[AppError]:
-        """Сохраняет факт публикации."""
-        ...
+    def set_published(self, record: PublicationRecord) -> List[AppError]: ...
 
 
 # -----------------------------
@@ -121,13 +92,8 @@ class PublicationRegistry(Protocol):
 
 def compute_window(now_utc: datetime, cfg: UsecaseConfig) -> Tuple[date, datetime, datetime]:
     """
-    Определяем "день запуска" по Москве и окно последних 48 часов,
-    считая от 08:00 MSK этого дня.
-
-    Возвращает:
-    - run_date_msk (ключ дня)
-    - window_start_utc
-    - window_end_utc
+    Окно: последние cfg.lookback_hours часов от 08:00 MSK текущего дня.
+    Если запустились раньше 08:00 MSK — используем якорь предыдущего дня.
     """
     if now_utc.tzinfo is None:
         now_utc = now_utc.replace(tzinfo=timezone.utc)
@@ -135,22 +101,19 @@ def compute_window(now_utc: datetime, cfg: UsecaseConfig) -> Tuple[date, datetim
     tz_msk = ZoneInfo(cfg.tz_msk)
     now_msk = now_utc.astimezone(tz_msk)
 
-    # привязка к 08:00 текущего московского дня
     anchor_msk = now_msk.replace(hour=cfg.publish_hour_msk, minute=0, second=0, microsecond=0)
-
-    # если мы запустились раньше 08:00 (например тест), якорь — предыдущий день 08:00
     if now_msk < anchor_msk:
-        anchor_msk = anchor_msk - timedelta(days=1)
+        anchor_msk -= timedelta(days=1)
 
     run_date_msk = anchor_msk.date()
-
     window_end_msk = anchor_msk
     window_start_msk = anchor_msk - timedelta(hours=cfg.lookback_hours)
 
-    window_start_utc = window_start_msk.astimezone(timezone.utc)
-    window_end_utc = window_end_msk.astimezone(timezone.utc)
-
-    return run_date_msk, window_start_utc, window_end_utc
+    return (
+        run_date_msk,
+        window_start_msk.astimezone(timezone.utc),
+        window_end_msk.astimezone(timezone.utc),
+    )
 
 
 # -----------------------------
@@ -159,7 +122,7 @@ def compute_window(now_utc: datetime, cfg: UsecaseConfig) -> Tuple[date, datetim
 
 
 def _index_rules(rules: List[ScoringRule]) -> Tuple[Dict[str, float], Dict[str, float]]:
-    """Разделяем rules на веса по player_id и team_id."""
+    """Собираем веса по игрокам и командам."""
     player_w: Dict[str, float] = {}
     team_w: Dict[str, float] = {}
 
@@ -169,9 +132,7 @@ def _index_rules(rules: List[ScoringRule]) -> Tuple[Dict[str, float], Dict[str, 
             player_w[r.entity_id] = player_w.get(r.entity_id, 0.0) + float(r.weight)
         elif et == "team":
             team_w[r.entity_id] = team_w.get(r.entity_id, 0.0) + float(r.weight)
-        else:
-            # неизвестный entity_type — игнорируем; это лучше ловить валидатором
-            continue
+
     return player_w, team_w
 
 
@@ -181,12 +142,11 @@ def score_matches(
     rules: List[ScoringRule],
 ) -> List[RankedMatch]:
     """
-    Черновая формула интересности (можно менять):
-    - базовый интерес = 0
+    Черновая формула интересности:
     - + вес команды (home + away), если есть в rules
     - + вес игрока * (goals + assists*0.5), если есть в rules
-    - + небольшой бонус за OT/SO (если известен)
-    - + небольшой бонус за общий тотал шайб (score_home + score_away) (без вывода наружу)
+    - + бонусы OT/SO
+    - + небольшой бонус за total_goals (только внутренняя логика; наружу не выводим)
     """
     player_w, team_w = _index_rules(rules)
 
@@ -199,25 +159,26 @@ def score_matches(
         score = 0.0
         contribs: List[ScoreContribution] = []
 
-        # team weights
         for t in (m.home, m.away):
             w = team_w.get(t.team_id)
             if w:
                 score += w
                 contribs.append(
                     ScoreContribution(
-                        reason="team_weight", weight=w, entity_type="team", entity_id=t.team_id
+                        reason="team_weight",
+                        weight=w,
+                        entity_type="team",
+                        entity_id=t.team_id,
                     )
                 )
 
-        # player weights
         for ps in stats_by_match.get(m.match_id, []):
             w = player_w.get(ps.player_id)
             if not w:
                 continue
             factor = float(ps.goals) + 0.5 * float(ps.assists)
             delta = w * factor
-            if delta != 0:
+            if delta:
                 score += delta
                 contribs.append(
                     ScoreContribution(
@@ -228,7 +189,6 @@ def score_matches(
                     )
                 )
 
-        # overtime / shootout
         if m.went_overtime:
             score += 0.2
             contribs.append(ScoreContribution(reason="overtime_bonus", weight=0.2))
@@ -236,31 +196,29 @@ def score_matches(
             score += 0.2
             contribs.append(ScoreContribution(reason="shootout_bonus", weight=0.2))
 
-        # total goals bonus (спойлерно, но только для расчета)
         total_goals = int(m.score_home) + int(m.score_away)
-        tg_bonus = min(1.0, total_goals / 10.0) * 0.2  # мягкий бонус
+        tg_bonus = min(1.0, total_goals / 10.0) * 0.2
         if tg_bonus:
             score += tg_bonus
             contribs.append(ScoreContribution(reason="total_goals_bonus", weight=tg_bonus))
 
         ranked.append(
             RankedMatch(
-                match=m, rank=MatchScore(match_id=m.match_id, score=score, contributions=contribs)
+                match=m,
+                rank=MatchScore(match_id=m.match_id, score=score, contributions=contribs),
             )
         )
 
-    # ранжирование: от большего score к меньшему
     ranked.sort(key=lambda rm: rm.rank.score, reverse=True)
     return ranked
 
 
 # -----------------------------
-# Core: videos -> public post items
+# Post building (public)
 # -----------------------------
 
 
 def _match_title(m: MatchForScoring) -> str:
-    """Короткий титул без спойлеров: ABBR — ABBR или name vs name."""
     h = m.home.abbr or m.home.name
     a = m.away.abbr or m.away.name
     return f"{h} — {a}"
@@ -270,21 +228,14 @@ def build_post_public(
     run_date_msk: date,
     now_utc: datetime,
     ranked: List[RankedMatch],
-    video_results: List[VideoLinkResult],
     cfg: UsecaseConfig,
     extra_errors: List[AppError],
 ) -> PostPublic:
     """
-    Собираем PostPublic (без спойлеров).
-    - матчи фильтруем по порогу интересности
-    - ссылки подставляем по kind
-    - если ссылки нет — оставляем None (рендер покажет 'не найдена')
+    MVP без VK:
+    - items: только матч (title) + rank_score (для дебага)
+    - никаких ссылок
     """
-    # индекс видео: match_id -> {kind -> VideoLinkResult}
-    vmap: Dict[str, Dict[VideoKind, VideoLinkResult]] = {}
-    for vr in video_results:
-        vmap.setdefault(vr.match_id, {})[vr.kind] = vr
-
     items: List[PostItemPublic] = []
     errors: List[AppError] = list(extra_errors)
 
@@ -292,26 +243,14 @@ def build_post_public(
         if rm.rank.score < cfg.min_interest_score:
             continue
 
-        vids = vmap.get(rm.match.match_id, {})
-        h = vids.get(VideoKind.HIGHLIGHTS)
-        f = vids.get(VideoKind.FULL)
-
-        highlights_url = h.url if (h and h.status == VideoStatus.FOUND) else None
-        full_url = f.url if (f and f.status == VideoStatus.FOUND) else None
-
-        # если ERROR — добавляем ошибку в общий список (как warning)
-        for vr in (h, f):
-            if vr and vr.status == VideoStatus.ERROR and vr.error:
-                errors.append(vr.error)
-
         items.append(
             PostItemPublic(
                 match_id=rm.match.match_id,
                 title=_match_title(rm.match),
                 start_time_utc=rm.match.start_time_utc,
-                highlights_url=highlights_url,
-                full_url=full_url,
-                rank_score=rm.rank.score,  # не обязаны выводить, но держим для дебага
+                highlights_url=None,  # не используем в MVP
+                full_url=None,  # не используем в MVP
+                rank_score=rm.rank.score,
             )
         )
 
@@ -330,8 +269,7 @@ def build_post_public(
 
 def render_post(post: PostPublic) -> str:
     """
-    Рендерит PostPublic в текст для Telegram.
-    Без счетов и без деталей событий.
+    MVP без VK: выводим только список матчей.
     """
     lines: List[str] = []
 
@@ -340,25 +278,11 @@ def render_post(post: PostPublic) -> str:
     else:
         for it in post.items:
             lines.append(it.title)
+        # пустая строка после списка (аккуратно)
+        lines.append("")
 
-            # highlights
-            if it.highlights_url:
-                lines.append(f"  highlights: {it.highlights_url}")
-            else:
-                lines.append("  highlights: ссылка не найдена")
-
-            # full
-            if it.full_url:
-                lines.append(f"  full: {it.full_url}")
-            else:
-                lines.append("  full: ссылка не найдена")
-
-            lines.append("")  # пустая строка между матчами
-
-    # ошибки/предупреждения (внизу)
     if post.errors:
         lines.append("⚠️ Проблемы:")
-        # убираем дубли по (code, source, message)
         seen = set()
         for e in post.errors:
             key = (e.code, e.source.value, e.message)
@@ -380,56 +304,45 @@ def run_daily_digest(
     cfg: UsecaseConfig,
     results_loader: ResultsLoader,
     rules_loader: ScoringRulesLoader,
-    video_loader: VideoLoader,
     publisher: Publisher,
     registry: PublicationRegistry,
 ) -> Tuple[Optional[PostPublic], List[AppError]]:
-    """
-    Главный daily use-case:
-    1) time window
-    2) идемпотентность
-    3) load results
-    4) load rules
-    5) score+rank
-    6) load videos
-    7) build post + render
-    8) publish + register
-
-    Возвращает:
-    - post (если дошли до построения)
-    - errors (сквозные)
-    """
     errors: List[AppError] = []
 
     run_date_msk, window_start_utc, window_end_utc = compute_window(now_utc, cfg)
 
-    # idempotency check
-    rec, reg_err = registry.get(run_date_msk)
-    errors.extend(reg_err)
-
-    if rec and rec.published:
-        # Уже публиковали — выходим без дубля
+    # Idempotency: только в PROD
+    if not cfg.dry_run:
+        rec, reg_err = registry.get(run_date_msk)
+        errors.extend(reg_err)
+        if rec and rec.published:
+            errors.append(
+                AppError(
+                    code="ALREADY_PUBLISHED",
+                    source=SourceSystem.CORE,
+                    severity=Severity.WARNING,
+                    message=(
+                        f"Пост за {run_date_msk} уже был опубликован "
+                        f"(tg_message_id={rec.tg_message_id})."
+                    ),
+                )
+            )
+            return None, errors
+    else:
         errors.append(
             AppError(
-                code="ALREADY_PUBLISHED",
+                code="DRY_RUN",
                 source=SourceSystem.CORE,
                 severity=Severity.WARNING,
-                message=(
-                    f"Пост за {run_date_msk} уже был опубликован "
-                    f"(tg_message_id={rec.tg_message_id})."
-                ),
+                message="DRY_RUN=true: идемпотентность отключена, state не будет записан.",
             )
         )
-        return None, errors
 
     # load results
     matches, player_stats, res_err = results_loader.load(window_start_utc, window_end_utc)
     errors.extend(res_err)
 
-    # если вообще нет матчей — формируем пост "Матчей нет" (это не ошибка)
-    # но если при этом есть фатальная ошибка NHL — ты можешь потом поменять правило.
-    # Сейчас придерживаемся UX: если матчей нет — пишем "Матчей нет."
-    # А ошибки (если есть) добавятся внизу.
+    # если матчей нет — публикуем "Матчей нет."
     if not matches:
         post = PostPublic(
             run_date_msk=run_date_msk, generated_at_utc=now_utc, items=[], errors=errors
@@ -437,48 +350,54 @@ def run_daily_digest(
         text = render_post(post)
         msg_id, pub_err = publisher.publish(text)
         errors.extend(pub_err)
-        errors.extend(
-            registry.set_published(
-                PublicationRecord(run_date_msk=run_date_msk, published=True, tg_message_id=msg_id)
+
+        if (not cfg.dry_run) and msg_id:
+            errors.extend(
+                registry.set_published(
+                    PublicationRecord(
+                        run_date_msk=run_date_msk,
+                        published=True,
+                        tg_message_id=msg_id,
+                        published_at_utc=now_utc
+                        if now_utc.tzinfo
+                        else now_utc.replace(tzinfo=timezone.utc),
+                    )
+                )
             )
-        )
+
         return post, errors
 
     # load rules
     rules, rules_err = rules_loader.load()
     errors.extend(rules_err)
 
-    # score+rank
+    # score + rank
     ranked = score_matches(matches, player_stats, rules)
 
-    # load videos
-    match_ids = [rm.match.match_id for rm in ranked if rm.rank.score >= cfg.min_interest_score]
-    video_res, video_err = video_loader.load_for_matches(match_ids)
-    errors.extend(video_err)
-
-    # build public post
-    post = build_post_public(run_date_msk, now_utc, ranked, video_res, cfg, extra_errors=errors)
+    # build post (без видео)
+    post = build_post_public(run_date_msk, now_utc, ranked, cfg, extra_errors=errors)
 
     # render & publish
     text = render_post(post)
     msg_id, pub_err = publisher.publish(text)
     errors.extend(pub_err)
 
-    # register published
-    errors.extend(
-        registry.set_published(
-            PublicationRecord(
-                run_date_msk=run_date_msk,
-                published=True,
-                tg_message_id=msg_id,
-                published_at_utc=(
-                    now_utc if now_utc.tzinfo else now_utc.replace(tzinfo=timezone.utc)
-                ),
+    # record publication (только PROD)
+    if (not cfg.dry_run) and msg_id:
+        errors.extend(
+            registry.set_published(
+                PublicationRecord(
+                    run_date_msk=run_date_msk,
+                    published=True,
+                    tg_message_id=msg_id,
+                    published_at_utc=now_utc
+                    if now_utc.tzinfo
+                    else now_utc.replace(tzinfo=timezone.utc),
+                )
             )
         )
-    )
 
-    # обновим post.errors финальным списком (на случай ошибок публикации/реестра)
+    # финализируем ошибки в post
     post = PostPublic(
         run_date_msk=post.run_date_msk,
         generated_at_utc=post.generated_at_utc,
@@ -493,21 +412,8 @@ def run_daily_digest(
 # -----------------------------
 
 
-class InMemoryPublicationRegistry:
-    def __init__(self) -> None:
-        self._store: Dict[date, PublicationRecord] = {}
-
-    def get(self, run_date_msk: date) -> Tuple[Optional[PublicationRecord], List[AppError]]:
-        return self._store.get(run_date_msk), []
-
-    def set_published(self, record: PublicationRecord) -> List[AppError]:
-        self._store[record.run_date_msk] = record
-        return []
-
-
 class MockResultsLoader:
     def load(self, window_start_utc: datetime, window_end_utc: datetime):
-        # два "финальных" матча в окне
         m1 = MatchForScoring(
             match_id="m1",
             start_time_utc=window_end_utc - timedelta(hours=6),
@@ -561,30 +467,6 @@ class MockScoringRulesLoader:
         return rules, []
 
 
-class MockVideoLoader:
-    def load_for_matches(self, match_ids: List[str]):
-        out: List[VideoLinkResult] = []
-        for mid in match_ids:
-            out.append(
-                VideoLinkResult(
-                    match_id=mid,
-                    kind=VideoKind.HIGHLIGHTS,
-                    status=VideoStatus.FOUND,
-                    url=f"https://vk.example/{mid}/highlights",
-                )
-            )
-            # допустим, полная запись иногда не находится
-            out.append(
-                VideoLinkResult(
-                    match_id=mid,
-                    kind=VideoKind.FULL,
-                    status=VideoStatus.NOT_FOUND,
-                    url=None,
-                )
-            )
-        return out, []
-
-
 class StdoutPublisher:
     def publish(self, text: str):
         print("----- PUBLISH -----")
@@ -593,8 +475,16 @@ class StdoutPublisher:
         return "mock_message_id", []
 
 
+class NoopRegistry:
+    def get(self, run_date_msk: date):
+        return None, []
+
+    def set_published(self, record: PublicationRecord):
+        return []
+
+
 if __name__ == "__main__":
-    cfg = UsecaseConfig(min_interest_score=0.0)
+    cfg = UsecaseConfig(min_interest_score=0.0, dry_run=True)  # DEV
     now_utc = datetime.now(timezone.utc)
 
     post, errs = run_daily_digest(
@@ -602,7 +492,8 @@ if __name__ == "__main__":
         cfg=cfg,
         results_loader=MockResultsLoader(),
         rules_loader=MockScoringRulesLoader(),
-        video_loader=MockVideoLoader(),
         publisher=StdoutPublisher(),
-        registry=InMemoryPublicationRegistry(),
+        registry=NoopRegistry(),
     )
+
+    print("errors:", errs)

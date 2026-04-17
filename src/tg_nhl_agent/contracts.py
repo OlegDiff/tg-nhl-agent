@@ -66,23 +66,16 @@ class Team:
 
 @dataclass(frozen=True)
 class MatchForScoring:
-    """
-    Матч как вход в скоринг.
-    ВАЖНО: score_home/score_away — спойлерные поля.
-    Они НИКОГДА не должны попадать в публичный вывод.
-    """
-
-    match_id: str
-    start_time_utc: datetime  # всегда UTC (или трактуем как UTC)
-    season: str  # например "2025-2026"
+    match_id: int
+    start_time_utc: datetime
     home: Team
     away: Team
 
-    # Спойлер: счет (нужен для твоей формулы интересности)
-    score_home: int
-    score_away: int
+    season: Optional[str] = None  # например "2025-2026"
 
-    # Опциональные признаки (если пригодятся)
+    score_home: Optional[int] = None
+    score_away: Optional[int] = None
+
     went_overtime: Optional[bool] = None
     went_shootout: Optional[bool] = None
 
@@ -94,8 +87,8 @@ class PlayerGameStats:
     Можно расширять, но лучше держать просто.
     """
 
-    match_id: str
-    player_id: str
+    match_id: int
+    player_id: int
     player_name: str
     team_id: str
     goals: int = 0
@@ -118,6 +111,19 @@ class ScoringRule:
 
 
 @dataclass(frozen=True)
+class FavoritePlayer:
+    """
+    Игрок, за которым следим (для бонусов в ранжировании).
+    player_id — NHL playerId (int).
+    team_id — аббревиатура команды (например "PIT").
+    """
+
+    player_id: int
+    team_id: str
+    label: Optional[str] = None
+
+
+@dataclass(frozen=True)
 class ScoreContribution:
     """
     Вклад конкретного правила/фактора в итоговый индекс.
@@ -134,7 +140,7 @@ class ScoreContribution:
 class MatchScore:
     """Индекс интересности матча + (опционально) разложение на вклады."""
 
-    match_id: str
+    match_id: int
     score: float
     contributions: List[ScoreContribution] = field(default_factory=list)
 
@@ -161,7 +167,7 @@ class VideoLinkResult:
     Если ERROR -> error обязателен.
     """
 
-    match_id: str
+    match_id: int
     kind: VideoKind
     status: VideoStatus
     url: Optional[str] = None
@@ -181,7 +187,7 @@ class PostItemPublic:
     Спойлеров здесь быть не должно (никаких счетов/стат).
     """
 
-    match_id: str
+    match_id: int
     title: str  # например "BOS — NYR"
     start_time_utc: datetime
 
