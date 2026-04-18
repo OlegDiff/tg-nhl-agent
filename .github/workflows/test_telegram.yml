@@ -2,6 +2,9 @@ name: Publish NHL Digest
 
 on:
   workflow_dispatch:
+  schedule:
+    - cron: "30 7 * * *"
+      timezone: "Europe/Moscow"
 
 jobs:
   publish:
